@@ -45,7 +45,7 @@
 ;;;   result has to be represented, a single cons cell is used.
 ;;;
 ;;; + For a small number of mapping entries, the number of entries and
-;;;   an alist are stored to represent the mapping.
+;;;   the entries are stored in a vector.
 ;;;
 ;;; + In the (uncommon) case that more than a few entries have to be
 ;;;   stored, a hash-table is used.
@@ -53,9 +53,25 @@
 ;;; Switches between representations happen when entries are added.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +packrat-hash-table-switch-point+ 16))
+  ;; The max number of entries in the vector before switching to a
+  ;; hash table.
+  (defconstant +packrat-hash-table-switch-point+ 20)
+  ;; The hash table is created with this :SIZE. There is some subtlety
+  ;; here as SBCL's adaptive EQ hash tables perform a trick similar to
+  ;; the vector representation (called "flat hash table" there) up to
+  ;; SB-IMPL::+FLAT-LIMIT/EQ+ (16 or 32 depending on the platform
+  ;; currently). There are many entries already, there'll likely be
+  ;; more. To avoid the cost of SBCL having to switching away from the
+  ;; flat representation, we specify a number greater than the maximum
+  ;; flat size.
+  (defconstant +packrat-initial-hash-table-size+
+    #+sbcl (max 33 (* 2 +packrat-hash-table-switch-point+))
+    #-sbcl (* 2 +packrat-hash-table-switch-point+))
+  (defconstant +packrat-cache-array-size+
+    (1+ (* 2 +packrat-hash-table-switch-point+))))
 
-(declaim (ftype (function (symbol input-position chunk-cache) (values t &optional))
+(declaim (ftype (function (symbol input-position chunk-cache)
+                          (values t &optional))
                 cached))
 (defun cached (symbol position cache)
   (declare (optimize speed))
@@ -65,26 +81,21 @@
                        (aref chunk position-2))))
     (cond ((null cell)
            nil)
-          ((not (consp cell))
-           (values (gethash symbol cell)))
-          ((not (consp (cdr cell)))
+          ((consp cell)
            (when (eq (car cell) symbol)
              (cdr cell)))
+          ((typep cell '(simple-vector #.+packrat-cache-array-size+))
+           (let ((fill-pointer (aref cell 0)))
+             (declare (type (integer 0 #.+packrat-cache-array-size+)
+                            fill-pointer))
+             (loop for i upfrom 1 below fill-pointer by 2
+                   when (eq (aref cell i) symbol)
+                     do (return (aref cell (1+ i))))))
           (t
-           (values (assoc-value (cdr cell) symbol :test #'eq))))))
+           (values (gethash symbol cell))))))
 
-;;; Like ALEXANDRIA:ALIST-HASH-TABLE but quicker because it assumes
-;;; that there are no duplicate keys (of which alists prefer the
-;;; first) and it allows the call to MAKE-HASH-TABLE to be optimized.
-(defmacro alist-hash-table/no-dups (alist &rest hash-table-initargs)
-  (declare (optimize speed))
-  (with-gensyms (table cons)
-    `(let ((,table (make-hash-table ,@hash-table-initargs)))
-       (dolist (,cons ,alist)
-         (setf (gethash (car ,cons) ,table) (cdr ,cons)))
-       ,table)))
-
-(declaim (ftype (function (t symbol input-position chunk-cache) (values t &optional))
+(declaim (ftype (function (t symbol input-position chunk-cache)
+                          (values t &optional))
                 (setf cached)))
 (defun (setf cached) (result symbol position cache)
   (declare (optimize speed))
@@ -93,49 +104,53 @@
          (cell       (aref chunk position-2)))
     (cond
 
-      ;; No entry => Create a singleton entry using one CONS.
+      ;; No entry (NIL) => single entry (CONS)
       ((null cell)
        (setf (aref chunk position-2) (cons symbol result)))
 
-      ;; Not a CONS => Has to be a hash-table. Store the result.
-      ((not (consp cell))
-       (setf (gethash symbol cell) result))
-
-      ;; A singleton CONS => Maybe extend to a list of the form
-      ;;
-      ;;   (LENGTH . (KEY1 . RESULT1) (KEY2 . RESULT2) ...)
-      ;;
-      ;; where LENGTH is initially 2 after upgrading from a singleton
-      ;; CONS.
-      ((not (consp (cdr cell)))
+      ;; Single entry (CONS) => few entries (SIMPLE-VECTOR)
+      ((consp cell)
        (if (eq (car cell) symbol)
            (setf (cdr cell) result)
-           (setf (aref chunk position-2)
-                 (cons 2 (acons symbol result (list cell))))))
+           (let ((a (make-array +packrat-cache-array-size+)))
+             (setf (aref a 0) 5         ; fill pointer
+                   (aref a 1) (car cell)
+                   (aref a 2) (cdr cell)
+                   (aref a 3) symbol
+                   (aref a 4) result
+                   (aref chunk position-2) a))))
 
-      ;; A list with leading length as described above.
+      ;; Few entries (SIMPLE-VECTOR) => many entries (HASH-TABLE)
+      ((typep cell '(simple-vector #.+packrat-cache-array-size+))
+       (let* ((a cell)
+              (fill-pointer (aref a 0)))
+         (declare (type (integer 0 #.+packrat-cache-array-size+)
+                        fill-pointer))
+         ;; When there is an entry for SYMBOL, update it and return.
+         (loop for i upfrom 1 below fill-pointer by 2
+               when (eq (aref a i) symbol)
+                 do (setf (aref a (1+ i)) result)
+                    (return-from cached result))
+         ;; No existing entry
+         (cond
+           ;; With less than +PACKRAT-HASH-TABLE-SWITCH-POINT+
+           ;; entries, increase the fill-pointer and add an entry.
+           ((< fill-pointer +packrat-cache-array-size+)
+            (setf (aref a 0) (+ fill-pointer 2)
+                  (aref a fill-pointer) symbol
+                  (aref a (1+ fill-pointer)) result))
+           ;; With +PACKRAT-HASH-TABLE-SWITCH-POINT+ entries, upgrade
+           ;; to a HASH-TABLE, then store the new entry.
+           (t
+            (let ((table (make-hash-table
+                          :test #'eq :size +packrat-initial-hash-table-size+)))
+              (loop for i upfrom 1 below fill-pointer by 2
+                    do (setf (gethash (aref a i) table)
+                             (aref a (1+ i))))
+              (setf (aref chunk position-2) table)
+              (setf (gethash symbol table) result))))))
+
+      ;; Many entries (HASH-TABLE)
       (t
-       (let ((count   (car cell)) ; note: faster than DESTRUCTURING-BIND
-             (entries (cdr cell)))
-         (declare (type (integer 0 #.+packrat-hash-table-switch-point+) count))
-         (cond ;; When there is an entry for RESULT, update it.
-               ((when-let ((entry (assoc symbol entries :test #'eq)))
-                  (setf (cdr entry) result)
-                  t))
-               ;; When there are +PACKRAT-HASH-TABLE-SWITCH-POINT+
-               ;; entries and we need another one, upgrade to
-               ;; HASH-TABLE, then store the new entry.
-               ((= count +packrat-hash-table-switch-point+)
-                (let ((table (alist-hash-table/no-dups
-                              entries :test #'eq
-                              :size #.(* 2 +packrat-hash-table-switch-point+))))
-                  (setf (aref chunk position-2) table)
-                  (setf (gethash symbol table) result)))
-               ;; When there are less than
-               ;; +PACKRAT-HASH-TABLE-SWITCH-POINT+ entries and we
-               ;; need another one, increase the counter and add an
-               ;; entry.
-               (t
-                (setf (car cell) (1+ count))
-                (setf (cdr cell) (acons symbol result entries))))))))
+       (setf (gethash symbol cell) result))))
   result)

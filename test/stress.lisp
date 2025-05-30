@@ -30,7 +30,7 @@
 (macrolet ((define-rules ()
              (let ((names '()))
               `(progn
-                 ,@(loop :for i :from 0 :to (1+ esrap::+packrat-hash-table-switch-point+)
+                 ,@(loop :for i :from 0 :to (* 2 esrap::+packrat-hash-table-switch-point+)
                          :for string = (format nil "~R" i)
                          :for name = (intern string)
                          :do (push name names)
